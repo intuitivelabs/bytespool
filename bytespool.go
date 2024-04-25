@@ -51,7 +51,8 @@ func (bp *Bpool) Init(minSz, maxSz, roundTo int) bool {
 // Get tries to allocate a byte slice from the pool.
 // It returns the byte slice with len == sz on success and
 // true if it was found in the pool or false if not and alloc == true
-// (was allocated).
+// (was allocated). The boolean return value could be used to implement a
+// hit/miss counter.
 // On error it returns nil, false (not found in pool or size too big and
 // alloc == false).
 // For 0 size it returns always nil, true.
@@ -62,7 +63,7 @@ func (bp *Bpool) Get(sz int, alloc bool) ([]byte, bool) {
 	}
 	if sz > bp.maxSz {
 		if alloc {
-			return make([]byte, sz), true
+			return make([]byte, sz), false // miss, allocated
 		}
 		return nil, false
 	}
@@ -83,7 +84,7 @@ func (bp *Bpool) Get(sz int, alloc bool) ([]byte, bool) {
 	}
 	if p == nil {
 		if alloc {
-			return make([]byte, sz, max), true
+			return make([]byte, sz, max), false // miss, allocated
 		}
 		return nil, false
 	}
@@ -93,15 +94,15 @@ func (bp *Bpool) Get(sz int, alloc bool) ([]byte, bool) {
 	slice.Len = int(sz)
 	slice.Cap = int(max)
 	runtime.KeepAlive(p)
-	return buf, true
+	return buf, true // hit, found in the pool
 }
 
 // Put puts a bytes slice in the pool.
 // It returns true if it succeeded or false if it failed
-// (0 length slice or size too big)
+// (0 length slice or  size too big -- not in the pool)
 func (bp *Bpool) Put(buf []byte) bool {
 	if cap(buf) == 0 || len(buf) > bp.maxSz {
-		return false
+		return false // 0 length or size outside the pool
 	}
 	i := szPoolIdx(cap(buf), bp.roundTo, bp.minSz)
 	if i >= len(bp.pools) || i < 0 {
@@ -115,7 +116,8 @@ func (bp *Bpool) Put(buf []byte) bool {
 }
 
 // szRoundUp will return sz rounded up to a multiple of roundTo.
-//  0 will be rounded-up to roundTo
+//
+//	0 will be rounded-up to roundTo
 func szRoundUp(sz, roundTo int) int {
 	return ((sz-1)/roundTo + 1) * roundTo
 }
