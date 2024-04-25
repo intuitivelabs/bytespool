@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"runtime"
 	"runtime/debug"
 	"testing"
 	"time"
@@ -69,11 +70,15 @@ func TestPoolIdx(t *testing.T) {
 
 func TestPoolOps(t *testing.T) {
 
-	for n := 0; n < 100; n++ {
+	memLim := debug.SetMemoryLimit(-1)
+	gcPcnt := debug.SetGCPercent(-1)
+	debug.SetGCPercent(gcPcnt)
+	t.Logf("system memory limit %d, GC Percent %d%%\n", memLim, gcPcnt)
+	for n := 0; n < 1000; n++ {
 		var bp Bpool
 
 		minSz := int(rand.Int63n(128))
-		maxSz := int(rand.Int63n(1024*1024)) + 1024
+		maxSz := int(rand.Int63n(64*1024)) + 1024
 		if maxSz <= minSz {
 			maxSz = minSz + 1024
 		}
@@ -83,7 +88,12 @@ func TestPoolOps(t *testing.T) {
 			t.Fatalf("bpool init failed for %d, %d, %d\n",
 				minSz, maxSz, roundTo)
 		}
-		for i := 0; i < 100; i++ {
+		t.Logf("%3d. using min size %d, max size %d, roundTo %d\n",
+			n, minSz, maxSz, roundTo)
+
+		allocs := make([][]byte, 1000)
+
+		for i := 0; i < len(allocs); i++ {
 			sz := int(rand.Int63n(2 * int64(maxSz)))
 			// test no alloc
 			b, ok := bp.Get(sz, false)
@@ -101,39 +111,88 @@ func TestPoolOps(t *testing.T) {
 				t.Fatalf("bpool Get(%d, true) failed: [%d], %v\n",
 					sz, len(b), ok)
 			}
-			if sz != 0 && (!ok || len(b) != sz) {
+			if sz != 0 && (ok || len(b) != sz) {
+				// should return a slice of len sz and false (not found
+				// in the pool since we started with an empty one)
 				t.Fatalf("bpool Get(%d, true) failed: [%d], %v"+
-					" (min %d max %d round %d)\n",
+					" (min %d max %d roundTo %d)\n",
 					sz, len(b), ok, minSz, maxSz, roundTo)
 			}
 
 			// test Put
+			if sz != 0 && sz <= maxSz {
+				runtime.SetFinalizer(&b[0], func(blk *byte) {
+					t.Logf("finalizer for block %3d: %p size %d max %d"+
+						" called\n",
+						i, blk, sz, maxSz)
+				})
+			}
 			// disable GC during the Put test
 			// (we want to make sure that Get() returns something)
-			gcPcnt := debug.SetGCPercent(-1)
+			gcPcnt = debug.SetGCPercent(-1)
+			var gcStats1, gcStats2 debug.GCStats
+			debug.ReadGCStats(&gcStats1)
+
 			ok = bp.Put(b)
 			if sz != 0 && sz <= maxSz && !ok {
 				t.Fatalf("bpool Put([%d] len %d cap %d) failed:  %v"+
-					" (min %d max %d round %d)\n",
+					" (min %d max %d roundTo %d)\n",
 					sz, len(b), cap(b), ok, minSz, maxSz, roundTo)
 			}
 			if (sz > maxSz || sz == 0) && ok {
 				t.Fatalf("bpool Put([%d] len %d cap %d) succeeded:  %v"+
-					" (min %d max %d round %d)\n",
+					" (min %d max %d roundTo %d)\n",
 					sz, len(b), cap(b), ok, minSz, maxSz, roundTo)
 			}
 			if sz != 0 && sz <= maxSz {
 				// Get after Put
 				b, ok = bp.Get(sz, false)
+				debug.ReadGCStats(&gcStats2)
+				if (gcStats2.LastGC != gcStats1.LastGC) ||
+					(gcStats2.NumGC != gcStats1.NumGC) {
+					t.Logf("GC run when gc disabled: "+
+						" %d (%s) != %d (%s)\n",
+						gcStats1.NumGC, gcStats1.LastGC,
+						gcStats2.NumGC, gcStats2.LastGC)
+				}
 				if sz == 0 || !ok || len(b) != sz {
-					t.Fatalf("bpool Get(%d, true)  after Put failed:"+
+					// expected slice of len(sz) and true -- hit
+					debug.ReadGCStats(&gcStats2)
+					t.Fatalf("bpool Get(%d, false)  after Put failed:"+
 						" [%d] cap %d, %v"+
-						" (min %d max %d round %d)\n",
-						sz, len(b), cap(b), ok, minSz, maxSz, roundTo)
+						" (min %d max %d roundTo %d)"+
+						" GC runs:  before put %d (%s)  after %d (%s)"+"\n",
+						sz, len(b), cap(b), ok, minSz, maxSz, roundTo,
+						gcStats1.NumGC, gcStats1.LastGC,
+						gcStats2.NumGC, gcStats2.LastGC)
+				}
+				// save allocation
+				allocs[i] = b
+				runtime.SetFinalizer(&b[0], nil)
+				// re-enable GC
+				debug.SetGCPercent(gcPcnt)
+			}
+		} // end for ...len(allocs) -- alloc
+		// Put/free all the in-use blocks
+		for i := 0; i < len(allocs); i++ {
+			if allocs[i] != nil {
+				b := allocs[i]
+				sz := len(b)
+				ok := bp.Put(b)
+				if sz != 0 && sz <= maxSz && !ok {
+					t.Fatalf("bpool Put([%d] len %d cap %d) failed:  %v"+
+						" (min %d max %d roundTo %d) for alloc %d\n",
+						sz, len(b), cap(b), ok, minSz, maxSz, roundTo, i)
+				}
+				if (sz > maxSz || sz == 0) && ok {
+					t.Fatalf("bpool Put([%d] len %d cap %d) succeeded:  %v"+
+						" (min %d max %d roundTo %d) for alloc %d\n",
+						sz, len(b), cap(b), ok, minSz, maxSz, roundTo, i)
 				}
 			}
-			// re-enable GC
-			debug.SetGCPercent(gcPcnt)
-		}
+		} // end for ..len(allocs) - free
+		t.Logf("%3d. force GC (min size %d, max size %d, roundTo %d)\n",
+			n, minSz, maxSz, roundTo)
+		runtime.GC() // force GC run
 	}
 }
